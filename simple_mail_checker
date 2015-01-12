@@ -1,0 +1,153 @@
+#!/usr/bin/env python
+
+import os.path
+import sys
+import subprocess
+import gtk
+import appindicator
+import pynotify
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+import mailbox
+from email.parser import HeaderParser
+from email.utils import parseaddr
+from email.header import decode_header
+from cgi import escape
+
+# Name, path values of the mailboxes to check
+mailboxes = {'gmail': '~/Mail/INBOX'}
+mailbox_type = mailbox.Maildir
+#mailbox_type = mailbox.mbox
+
+# Check for new mail periodically
+timed_check = False
+check_minutes = 2
+
+# Alternatively/as well add dbus call after mail sync,
+# or on closing mail client etc.
+# e.g. for offlineimap add to config file in [Account X] section
+# postsynchook=qdbus org.maildirchecker.maildirchecker \
+#              /org/maildirchecker/maildirchecker check_mail_dirs
+
+# Command and args to open mail client when a new mail menu entry is clicked.
+# The location of the mailbox is added as a final argument
+open_client_command = ["mutt-indicator", "-f"]
+# example script mutt-indicator:
+#
+# $args =  "$@"
+# gnome-terminal --disable-factory -e "mutt $args"
+# qdbus org.maildirchecker.maildirchecker /org/maildirchecker/maildirchecker \
+# check_mail_dirs
+
+nomail_icon = 'evolution-mail'
+newmail_icon = 'mail-unread'
+#nomail_icon = 'xfce-nomail'
+#newmail_icon = 'xfce-newmail'
+
+
+class MaildirChecker(dbus.service.Object):
+    """Simple new mail indicator and notifier for local mail folders."""
+
+    def __init__(self, mailboxes):
+        busName = dbus.service.BusName(
+            'org.maildirchecker.maildirchecker',
+            bus=dbus.SessionBus(), do_not_queue=True)
+        dbus.service.Object.__init__(
+            self, busName, '/org/maildirchecker/maildirchecker')
+        pynotify.init("maildirchecker")
+
+        self.mailboxes = mailboxes
+        for name, path in self.mailboxes.items():
+            self.mailboxes[name] = os.path.expanduser(path)
+        self.hp = HeaderParser()
+        self.unseens = dict((i, {}) for i in self.mailboxes.keys())
+        if mailbox_type == mailbox.Maildir:
+            self.seen_flag = 'S'
+        elif mailbox_type == mailbox.mbox:
+            self.seen_flag = 'R'
+
+        self.ind = appindicator.Indicator(
+            'debian-doc-menu', nomail_icon,
+            appindicator.CATEGORY_APPLICATION_STATUS)
+        self.ind.set_attention_icon(newmail_icon)
+        self.ind.set_status(appindicator.STATUS_ACTIVE)
+        self.menu_setup()
+        self.ind.set_menu(self.menu)
+
+    @dbus.service.method('org.maildirchecker.maildirchecker')
+    def check_mail_dirs(self):
+        new_unseens = set()
+        for name, mbox in self.mailboxes.iteritems():
+            if not os.path.exists(mbox):
+                raise Exception
+            md = mailbox_type(mbox, None, create=False)
+            print md
+
+            for key, m in md.iteritems():
+                if self.seen_flag in m.get_flags():
+                    continue
+                new_unseens.add(m['message-id'])
+                if m['message-id'] in self.unseens[name]:
+                    continue
+                from_addr = self.parse_from(m['from'])
+                self.add_menu_item(name, mbox, from_addr,
+                                   m['message-id'])
+                pynotify.Notification(
+                    "New mail in {}".format(name),
+                    'from: {}\n{}'.format(
+                        from_addr,
+                        escape(decode_header(m['subject'])[0][0]))).show()
+            md.close()
+
+        for u in self.unseens[name].keys():
+            if u not in new_unseens:
+                self.ind.get_menu().remove(self.unseens[name][u])
+                del self.unseens[name][u]
+
+        if any([len(i) > 0 for i in self.unseens.values()]):
+            self.ind.set_status(appindicator.STATUS_ATTENTION)
+        else:
+            self.ind.set_status(appindicator.STATUS_ACTIVE)
+        return True
+
+    def add_menu_item(self, name, path, from_addr, mid):
+        new_menu_item = gtk.MenuItem('{}: {}'.format(name, from_addr))
+        new_menu_item.connect(
+            "activate",
+            lambda x: self.open_client(x, os.path.join(name, path)))
+        new_menu_item.show()
+        self.ind.get_menu().prepend(new_menu_item)
+        self.unseens[name][mid] = new_menu_item
+
+    def menu_setup(self):
+        self.menu = gtk.Menu()
+        self.quit_item = gtk.MenuItem("Quit")
+        self.quit_item.connect("activate", self.quit)
+        self.quit_item.show()
+        self.menu.append(self.quit_item)
+
+    def open_client(self, widget, location):
+        subprocess.Popen(open_client_command + [location])
+
+    def parse_from(self, from_addr):
+        pf = parseaddr(from_addr)
+        if pf[0]:
+            return decode_header(pf[0])[0][0]
+        else:
+            return pf[1]
+
+    def main(self):
+        if timed_check:
+            gtk.timeout_add(int(check_minutes * 60 * 1000),
+                            self.check_mail_dirs)
+        gtk.main()
+
+    def quit(self, widget):
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    DBusGMainLoop(set_as_default=True)
+    indicator = MaildirChecker(mailboxes)
+    indicator.main()
